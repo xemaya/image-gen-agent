@@ -20,8 +20,8 @@ from functools import lru_cache
 
 import boto3
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 
 from a2h_agent import (
     ChatRequest,
@@ -80,12 +80,40 @@ def seller_id() -> str:
     return os.environ.get("A2H_SELLER_ID", "")
 
 
-app = FastAPI(title="image-gen-agent", version="1.1.2")
+app = FastAPI(title="image-gen-agent", version="1.2.0")
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/invoke")
+async def invoke(request: Request) -> Response:
+    """RPC-style endpoint exposed via the platform's
+    ``POST /api/v1/shops/{shopId}/invoke`` proxy. Body: {"prompt": "..."}.
+    Returns raw PNG bytes with Content-Type image/png — no SSE, no S3
+    upload. The caller gets the image directly in one HTTP round-trip.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="body must be JSON")
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="missing 'prompt'")
+
+    try:
+        png_bytes = await generate_png(prompt)
+    except Exception as ex:  # noqa: BLE001
+        LOG.exception("invoke: image gen failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"image generation failed: {ex.__class__.__name__}: {ex}",
+        )
+
+    return Response(content=png_bytes, media_type="image/png")
 
 
 @app.post("/chat")
