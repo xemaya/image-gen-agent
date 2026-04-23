@@ -3,7 +3,7 @@ kind: Agent
 
 metadata:
   name: image_gen
-  version: 1.1.1
+  version: 1.1.2
   displayName: AI 图片生成
   description: 发一段 prompt，用 OpenRouter openai/gpt-5.4-image-2 生成图片并返回 PNG。免费，不下单。
 
@@ -52,7 +52,7 @@ env:
 egress:
   - openrouter.ai                            # image generation via /chat/completions
   - ssm.us-east-1.amazonaws.com              # OpenRouter key + bypass key
-  - api.a2hmarket.ai                         # a2h.* tools (findu-oss presign)
+  - findu-alb-476446960.us-east-1.elb.amazonaws.com   # internal ALB → findu-oss
   - s3.amazonaws.com                         # PUT presigned URL
   - s3.us-east-1.amazonaws.com
   - findu-media-us.s3.amazonaws.com

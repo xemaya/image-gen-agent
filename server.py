@@ -24,7 +24,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from a2h_agent import (
-    A2HClient,
     ChatRequest,
     done,
     error,
@@ -44,6 +43,15 @@ OPENROUTER_KEY_PARAM = os.environ.get(
 )
 OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 
+# Internal ALB + gateway bypass for findu-oss presign (same pattern as
+# zhangxuefeng/renew-life). A2HClient's bearer-token path doesn't cover
+# /findu-oss/*, so we bypass-call the ALB directly.
+FINDU_ALB = os.environ.get(
+    "A2H_FINDU_ALB",
+    "http://findu-alb-476446960.us-east-1.elb.amazonaws.com",
+).rstrip("/")
+SSM_GATEWAY_BYPASS = "/a2h/agents/shared/gateway-bypass-key"
+
 
 @lru_cache(maxsize=1)
 def openrouter_api_key() -> str:
@@ -57,7 +65,22 @@ def openrouter_api_key() -> str:
     return resp["Parameter"]["Value"]
 
 
-app = FastAPI(title="image-gen-agent", version="1.1.1")
+@lru_cache(maxsize=1)
+def gateway_bypass_key() -> str:
+    """Shared platform bypass key for internal-ALB findu-* calls."""
+    direct = os.environ.get("A2H_GATEWAY_BYPASS")
+    if direct:
+        return direct
+    ssm = boto3.client("ssm", region_name=AWS_REGION)
+    resp = ssm.get_parameter(Name=SSM_GATEWAY_BYPASS, WithDecryption=True)
+    return resp["Parameter"]["Value"]
+
+
+def seller_id() -> str:
+    return os.environ.get("A2H_SELLER_ID", "")
+
+
+app = FastAPI(title="image-gen-agent", version="1.1.2")
 
 
 @app.get("/health")
@@ -166,25 +189,42 @@ async def generate_png(prompt: str) -> bytes:
 
 async def upload_png(png_bytes: bytes, *, file_name: str) -> str:
     """Presign via findu-oss (chatfile/image, max 10MB) then PUT to S3.
-    Returns the public URL."""
-    async with A2HClient() as a2h:
-        signed = await a2h.file_upload(
-            file_name=file_name,
-            file_size=len(png_bytes),
-            file_type="image/png",
-            upload_type="chatfile",
-            upload_subtype="image",
-        )
-    upload_url = signed["uploadUrl"]
-    public_url = signed.get("publicUrl") or upload_url.split("?", 1)[0]
-
+    Returns the public URL. Bypasses the public gateway and hits the
+    internal ALB with the shared platform bypass key."""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Gateway-Bypass": gateway_bypass_key(),
+        "X-User-ID": seller_id(),
+    }
+    body = {
+        "uploadType": "chatfile",
+        "uploadSubtype": "image",
+        "fileName": file_name,
+        "fileSize": len(png_bytes),
+        "fileType": "image/png",
+    }
     async with httpx.AsyncClient(timeout=30.0) as http:
-        resp = await http.put(
-            upload_url,
-            content=png_bytes,
-            headers={"Content-Type": "image/png"},
+        resp = await http.post(
+            f"{FINDU_ALB}/findu-oss/api/v1/oss_signurl/upload/sign",
+            json=body, headers=headers,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(f"presign HTTP {resp.status_code}: {resp.text[:300]}")
+        env = resp.json()
+        if env.get("code") not in ("OK", "0", 0, None):
+            raise RuntimeError(f"presign {env.get('code')}: {env.get('message')}")
+        signed = env.get("data") or {}
+
+        upload_url = (signed.get("uploadUrl") or signed.get("signedUrl")
+                      or signed.get("url"))
+        if not upload_url:
+            raise RuntimeError(f"presign missing uploadUrl: {signed}")
+        public_url = (signed.get("publicUrl") or signed.get("downloadUrl")
+                      or upload_url.split("?", 1)[0])
+
+        put_resp = await http.put(upload_url, content=png_bytes,
+                                  headers={"Content-Type": "image/png"})
+        put_resp.raise_for_status()
     return public_url
 
 
