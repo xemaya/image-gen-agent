@@ -3,7 +3,7 @@ kind: Agent
 
 metadata:
   name: image_gen
-  version: 1.2.0
+  version: 1.2.1
   displayName: AI 图片生成
   description: 发一段 prompt，用 OpenRouter openai/gpt-5.4-image-2 生成图片并返回 PNG。免费，不下单。
 

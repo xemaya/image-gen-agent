@@ -80,7 +80,7 @@ def seller_id() -> str:
     return os.environ.get("A2H_SELLER_ID", "")
 
 
-app = FastAPI(title="image-gen-agent", version="1.2.0")
+app = FastAPI(title="image-gen-agent", version="1.2.1")
 
 
 @app.get("/health")
@@ -89,11 +89,15 @@ def health() -> dict[str, str]:
 
 
 @app.post("/invoke")
-async def invoke(request: Request) -> Response:
+async def invoke(request: Request) -> dict[str, object]:
     """RPC-style endpoint exposed via the platform's
     ``POST /api/v1/shops/{shopId}/invoke`` proxy. Body: {"prompt": "..."}.
-    Returns raw PNG bytes with Content-Type image/png — no SSE, no S3
-    upload. The caller gets the image directly in one HTTP round-trip.
+
+    Generates the image, uploads to findu-oss (public findu-media-us
+    bucket) and returns a JSON envelope with the public URL. Returning
+    JSON instead of raw bytes is what downstream agents' generic
+    httpPost tools expect — binary PNG read as String gets mangled by
+    charset decoding, and JSON is the lingua franca.
     """
     try:
         body = await request.json()
@@ -113,7 +117,22 @@ async def invoke(request: Request) -> Response:
             detail=f"image generation failed: {ex.__class__.__name__}: {ex}",
         )
 
-    return Response(content=png_bytes, media_type="image/png")
+    file_name = _derive_filename("invoke")
+    try:
+        public_url = await upload_png(png_bytes, file_name=file_name)
+    except Exception as ex:  # noqa: BLE001
+        LOG.exception("invoke: upload failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"upload failed: {ex.__class__.__name__}: {ex}",
+        )
+
+    return {
+        "url": public_url,
+        "name": file_name,
+        "mime": "image/png",
+        "size": len(png_bytes),
+    }
 
 
 @app.post("/chat")
