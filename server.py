@@ -24,8 +24,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from a2h_agent import (
+    A2HClient,
     ChatRequest,
-    PlatformClient,
     done,
     error,
     text,
@@ -57,7 +57,7 @@ def openrouter_api_key() -> str:
     return resp["Parameter"]["Value"]
 
 
-app = FastAPI(title="image-gen-agent", version="1.1.0")
+app = FastAPI(title="image-gen-agent", version="1.1.1")
 
 
 @app.get("/health")
@@ -167,8 +167,8 @@ async def generate_png(prompt: str) -> bytes:
 async def upload_png(png_bytes: bytes, *, file_name: str) -> str:
     """Presign via findu-oss (chatfile/image, max 10MB) then PUT to S3.
     Returns the public URL."""
-    async with PlatformClient() as p:
-        signed = await p.file_upload_presign(
+    async with A2HClient() as a2h:
+        signed = await a2h.file_upload(
             file_name=file_name,
             file_size=len(png_bytes),
             file_type="image/png",
