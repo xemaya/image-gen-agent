@@ -1,10 +1,12 @@
-"""image-gen-agent — a2hmarket shop agent: prompt → OpenAI gpt-image-2 → PNG.
+"""image-gen-agent — a2hmarket shop agent: prompt → OpenRouter image model → PNG.
 
 Flow per /chat turn:
 1. Parse ChatRequest, take the latest buyer text as the image prompt.
-2. Call OpenAI's `images.generate` (model `gpt-image-2-2026-04-21`), get b64.
-3. Presign a `chatfile/image` upload via findu-oss, PUT the PNG to S3.
-4. Emit `ui("show_file", ...)` with the public URL, then `done()`.
+2. POST to OpenRouter /chat/completions with modalities=["image","text"].
+3. Read the returned data URL from choices[0].message.images[0].image_url.url,
+   strip the `data:image/png;base64,` prefix, decode.
+4. Presign a `chatfile/image` upload via findu-oss, PUT the PNG to S3.
+5. Emit `ui("show_file", ...)` with the public URL, then `done()`.
 
 No orders, no payment — free generation. Single tool: `a2h.file.upload`.
 """
@@ -20,7 +22,6 @@ import boto3
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
 
 from a2h_agent import (
     ChatRequest,
@@ -36,31 +37,27 @@ LOG = logging.getLogger("image_gen")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
-MODEL_ID = os.environ.get("IMAGE_GEN_MODEL", "gpt-image-2-2026-04-21")
+MODEL_ID = os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.4-image-2")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-OPENAI_KEY_PARAM = os.environ.get(
-    "OPENAI_API_KEY_PARAM", "/a2h/agents/image-gen/openai-api-key"
+OPENROUTER_KEY_PARAM = os.environ.get(
+    "OPENROUTER_API_KEY_PARAM", "/a2h/agents/image-gen/openrouter-api-key"
 )
+OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 
 
 @lru_cache(maxsize=1)
-def openai_api_key() -> str:
-    """Resolve the OpenAI key: env OPENAI_API_KEY first (local dev),
+def openrouter_api_key() -> str:
+    """Resolve the OpenRouter key: env OPENROUTER_API_KEY first (local dev),
     otherwise pull from SSM once per worker."""
-    direct = os.environ.get("OPENAI_API_KEY")
+    direct = os.environ.get("OPENROUTER_API_KEY")
     if direct:
         return direct
     ssm = boto3.client("ssm", region_name=AWS_REGION)
-    resp = ssm.get_parameter(Name=OPENAI_KEY_PARAM, WithDecryption=True)
+    resp = ssm.get_parameter(Name=OPENROUTER_KEY_PARAM, WithDecryption=True)
     return resp["Parameter"]["Value"]
 
 
-@lru_cache(maxsize=1)
-def openai_client() -> AsyncOpenAI:
-    return AsyncOpenAI(api_key=openai_api_key())
-
-
-app = FastAPI(title="image-gen-agent", version="1.0.0")
+app = FastAPI(title="image-gen-agent", version="1.1.0")
 
 
 @app.get("/health")
@@ -95,7 +92,7 @@ async def chat(request: Request) -> StreamingResponse:
             try:
                 png_bytes = await generate_png(prompt)
             except Exception as ex:  # noqa: BLE001
-                LOG.exception("openai image generation failed")
+                LOG.exception("openrouter image generation failed")
                 yield error("IMAGE_GEN_FAILED", f"生成失败：{ex.__class__.__name__}: {ex}")
                 yield done()
                 return
@@ -126,12 +123,44 @@ async def chat(request: Request) -> StreamingResponse:
 
 
 async def generate_png(prompt: str) -> bytes:
-    """Call OpenAI images.generate; return raw PNG bytes."""
-    client = openai_client()
-    result = await client.images.generate(model=MODEL_ID, prompt=prompt)
-    b64 = result.data[0].b64_json
-    if not b64:
-        raise RuntimeError("OpenAI returned no b64_json")
+    """Call OpenRouter /chat/completions with multimodal image output.
+    Response shape: choices[0].message.images[i].image_url.url is a data URL.
+    """
+    payload = {
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image", "text"],
+    }
+    headers = {
+        "Authorization": f"Bearer {openrouter_api_key()}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=180.0) as http:
+        resp = await http.post(f"{OPENROUTER_BASE}/chat/completions",
+                               json=payload, headers=headers)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"OpenRouter HTTP {resp.status_code}: {resp.text[:400]}"
+            )
+        body = resp.json()
+
+    try:
+        message = body["choices"][0]["message"]
+    except (KeyError, IndexError) as ex:
+        raise RuntimeError(f"Unexpected OpenRouter response: {body!r}") from ex
+
+    images = message.get("images") or []
+    if not images:
+        finish = body["choices"][0].get("finish_reason")
+        snippet = str(message.get("content") or "")[:200]
+        raise RuntimeError(
+            f"OpenRouter returned no images (finish_reason={finish}, text={snippet!r})"
+        )
+
+    data_url = images[0].get("image_url", {}).get("url") or ""
+    if "," not in data_url:
+        raise RuntimeError(f"bad data URL shape: {data_url[:80]!r}")
+    _, b64 = data_url.split(",", 1)
     return base64.b64decode(b64)
 
 

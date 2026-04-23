@@ -3,9 +3,9 @@ kind: Agent
 
 metadata:
   name: image_gen
-  version: 1.0.0
+  version: 1.1.0
   displayName: AI 图片生成
-  description: 发一段 prompt，用 OpenAI gpt-image-2 生成图片并返回 PNG。免费，不下单。
+  description: 发一段 prompt，用 OpenRouter openai/gpt-5.4-image-2 生成图片并返回 PNG。免费，不下单。
 
 runtime:
   type: sandbox
@@ -17,7 +17,7 @@ runtime:
     - 0.0.0.0
     - --port
     - "8080"
-  # Each OpenAI call is ~5-20s; 3 concurrent chats per worker is safe.
+  # Each image call is ~10-30s; 3 concurrent chats per worker is safe.
   concurrency: 3
 
 pool:
@@ -40,18 +40,18 @@ env:
     required: true
   - name: AWS_REGION
     required: false
-  # SSM parameter that holds the OpenAI API key. Agent reads via boto3 at
+  # SSM parameter that holds the OpenRouter API key. Agent reads via boto3 at
   # cold start; no plaintext key lives in the image or env.
-  - name: OPENAI_API_KEY_PARAM
+  - name: OPENROUTER_API_KEY_PARAM
     required: false
-    default: "/a2h/agents/image-gen/openai-api-key"
+    default: "/a2h/agents/image-gen/openrouter-api-key"
   - name: IMAGE_GEN_MODEL
     required: false
-    default: "gpt-image-2-2026-04-21"
+    default: "openai/gpt-5.4-image-2"
 
 egress:
-  - api.openai.com                           # image generation
-  - ssm.us-east-1.amazonaws.com              # OpenAI key + bypass key
+  - openrouter.ai                            # image generation via /chat/completions
+  - ssm.us-east-1.amazonaws.com              # OpenRouter key + bypass key
   - api.a2hmarket.ai                         # a2h.* tools (findu-oss presign)
   - s3.amazonaws.com                         # PUT presigned URL
   - s3.us-east-1.amazonaws.com
