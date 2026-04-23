@@ -1,0 +1,58 @@
+apiVersion: a2h/v2
+kind: Agent
+
+metadata:
+  name: image_gen
+  version: 1.0.0
+  displayName: AI 图片生成
+  description: 发一段 prompt，用 OpenAI gpt-image-2 生成图片并返回 PNG。免费，不下单。
+
+runtime:
+  type: sandbox
+  port: 8080
+  entrypoint:
+    - uvicorn
+    - server:app
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8080"
+  # Each OpenAI call is ~5-20s; 3 concurrent chats per worker is safe.
+  concurrency: 3
+
+pool:
+  initial_workers: 1
+  max_workers: 3
+  min_workers: 0
+
+resources:
+  cpu: 1
+  memory: 1024
+
+tools:
+  # Only surface we need — upload the generated PNG to findu-oss for show_file.
+  - a2h.file.upload
+
+env:
+  - name: A2H_TOKEN
+    required: true
+  - name: A2H_SHOP_ID
+    required: true
+  - name: AWS_REGION
+    required: false
+  # SSM parameter that holds the OpenAI API key. Agent reads via boto3 at
+  # cold start; no plaintext key lives in the image or env.
+  - name: OPENAI_API_KEY_PARAM
+    required: false
+    default: "/a2h/agents/image-gen/openai-api-key"
+  - name: IMAGE_GEN_MODEL
+    required: false
+    default: "gpt-image-2-2026-04-21"
+
+egress:
+  - api.openai.com                           # image generation
+  - ssm.us-east-1.amazonaws.com              # OpenAI key + bypass key
+  - api.a2hmarket.ai                         # a2h.* tools (findu-oss presign)
+  - s3.amazonaws.com                         # PUT presigned URL
+  - s3.us-east-1.amazonaws.com
+  - findu-media-us.s3.amazonaws.com

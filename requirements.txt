@@ -1,0 +1,3 @@
+# Base image already ships: fastapi, uvicorn, httpx, anthropic, pydantic,
+# boto3, a2h-agent, a2h-cli. Only OpenAI's async SDK is missing.
+openai>=1.50.0
