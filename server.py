@@ -1,12 +1,18 @@
-"""image-gen-agent — a2hmarket shop agent: prompt → OpenRouter image model → PNG.
+"""image-gen-agent — a2hmarket shop agent: prompt → Gemini image model → image.
 
 Flow per /chat turn:
 1. Parse ChatRequest, take the latest buyer text as the image prompt.
-2. POST to OpenRouter /chat/completions with modalities=["image","text"].
-3. Read the returned data URL from choices[0].message.images[0].image_url.url,
-   strip the `data:image/png;base64,` prefix, decode.
-4. Presign a `chatfile/image` upload via findu-oss, PUT the PNG to S3.
+2. POST to Google's generativelanguage API
+   (/v1beta/models/{model}:generateContent) with
+   responseModalities=[TEXT, IMAGE].
+3. Read inlineData (base64) from candidates[0].content.parts[*].inlineData
+   — keep whatever mimeType Gemini returns (typically image/jpeg).
+4. Presign a `chatfile/image` upload via findu-oss (slot accepts jpeg/png/gif/webp,
+   10 MB cap) and PUT the bytes to S3.
 5. Emit `ui("show_file", ...)` with the public URL, then `done()`.
+
+Model: gemini-3.1-flash-image-preview. 10-20 s / image, ~1408x768 JPEG,
+~900 KB average.
 
 No orders, no payment — free generation. Single tool: `a2h.file.upload`.
 """
@@ -36,12 +42,14 @@ LOG = logging.getLogger("image_gen")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
-MODEL_ID = os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.4-image-2")
+MODEL_ID = os.environ.get("IMAGE_GEN_MODEL", "gemini-3.1-flash-image-preview")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-OPENROUTER_KEY_PARAM = os.environ.get(
-    "OPENROUTER_API_KEY_PARAM", "/a2h/agents/image-gen/openrouter-api-key"
+GEMINI_KEY_PARAM = os.environ.get(
+    "GEMINI_API_KEY_PARAM", "/a2h/agents/image-gen/gemini-api-key"
 )
-OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
+GEMINI_BASE = os.environ.get(
+    "GEMINI_BASE", "https://generativelanguage.googleapis.com/v1beta",
+).rstrip("/")
 
 # Internal ALB + gateway bypass for findu-oss presign (same pattern as
 # zhangxuefeng/renew-life). A2HClient's bearer-token path doesn't cover
@@ -54,14 +62,14 @@ SSM_GATEWAY_BYPASS = "/a2h/agents/shared/gateway-bypass-key"
 
 
 @lru_cache(maxsize=1)
-def openrouter_api_key() -> str:
-    """Resolve the OpenRouter key: env OPENROUTER_API_KEY first (local dev),
+def gemini_api_key() -> str:
+    """Resolve the Gemini key: env GEMINI_API_KEY first (local dev),
     otherwise pull from SSM once per worker."""
-    direct = os.environ.get("OPENROUTER_API_KEY")
+    direct = os.environ.get("GEMINI_API_KEY")
     if direct:
         return direct
     ssm = boto3.client("ssm", region_name=AWS_REGION)
-    resp = ssm.get_parameter(Name=OPENROUTER_KEY_PARAM, WithDecryption=True)
+    resp = ssm.get_parameter(Name=GEMINI_KEY_PARAM, WithDecryption=True)
     return resp["Parameter"]["Value"]
 
 
@@ -80,7 +88,7 @@ def seller_id() -> str:
     return os.environ.get("A2H_SELLER_ID", "")
 
 
-app = FastAPI(title="image-gen-agent", version="1.2.1")
+app = FastAPI(title="image-gen-agent", version="1.3.0")
 
 
 @app.get("/health")
@@ -109,7 +117,7 @@ async def invoke(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="missing 'prompt'")
 
     try:
-        png_bytes = await generate_png(prompt)
+        img_bytes, mime = await generate_image(prompt)
     except Exception as ex:  # noqa: BLE001
         LOG.exception("invoke: image gen failed")
         raise HTTPException(
@@ -117,9 +125,9 @@ async def invoke(request: Request) -> dict[str, object]:
             detail=f"image generation failed: {ex.__class__.__name__}: {ex}",
         )
 
-    file_name = _derive_filename("invoke")
+    file_name = _derive_filename("invoke", mime)
     try:
-        public_url = await upload_png(png_bytes, file_name=file_name)
+        public_url = await upload_image(img_bytes, file_name=file_name, mime=mime)
     except Exception as ex:  # noqa: BLE001
         LOG.exception("invoke: upload failed")
         raise HTTPException(
@@ -130,8 +138,8 @@ async def invoke(request: Request) -> dict[str, object]:
     return {
         "url": public_url,
         "name": file_name,
-        "mime": "image/png",
-        "size": len(png_bytes),
+        "mime": mime,
+        "size": len(img_bytes),
     }
 
 
@@ -160,16 +168,16 @@ async def chat(request: Request) -> StreamingResponse:
             yield text(f"正在用 {MODEL_ID} 生成图片，请稍候…")
 
             try:
-                png_bytes = await generate_png(prompt)
+                img_bytes, mime = await generate_image(prompt)
             except Exception as ex:  # noqa: BLE001
-                LOG.exception("openrouter image generation failed")
+                LOG.exception("gemini image generation failed")
                 yield error("IMAGE_GEN_FAILED", f"生成失败：{ex.__class__.__name__}: {ex}")
                 yield done()
                 return
 
-            file_name = _derive_filename(req.session_id)
+            file_name = _derive_filename(req.session_id, mime)
             try:
-                public_url = await upload_png(png_bytes, file_name=file_name)
+                public_url = await upload_image(img_bytes, file_name=file_name, mime=mime)
             except Exception as ex:  # noqa: BLE001
                 LOG.exception("upload to findu-oss failed")
                 yield error("UPLOAD_FAILED", f"上传失败：{ex.__class__.__name__}: {ex}")
@@ -180,8 +188,8 @@ async def chat(request: Request) -> StreamingResponse:
                 "show_file",
                 url=public_url,
                 name=file_name,
-                mime="image/png",
-                size=len(png_bytes),
+                mime=mime,
+                size=len(img_bytes),
             )
             yield done()
         except Exception:  # noqa: BLE001
@@ -192,52 +200,58 @@ async def chat(request: Request) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-async def generate_png(prompt: str) -> bytes:
-    """Call OpenRouter /chat/completions with multimodal image output.
-    Response shape: choices[0].message.images[i].image_url.url is a data URL.
-    """
+async def generate_image(prompt: str) -> tuple[bytes, str]:
+    """Call Gemini generativelanguage v1beta :generateContent with
+    responseModalities=[TEXT, IMAGE]. Returns ``(bytes, mime)`` where
+    mime is whatever the model returned (typically image/jpeg)."""
+    url = f"{GEMINI_BASE}/models/{MODEL_ID}:generateContent"
     payload = {
-        "model": MODEL_ID,
-        "messages": [{"role": "user", "content": prompt}],
-        "modalities": ["image", "text"],
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
-    headers = {
-        "Authorization": f"Bearer {openrouter_api_key()}",
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=180.0) as http:
-        resp = await http.post(f"{OPENROUTER_BASE}/chat/completions",
-                               json=payload, headers=headers)
+    # Key goes in query for this API; header also works but query is canonical.
+    params = {"key": gemini_api_key()}
+
+    async with httpx.AsyncClient(timeout=120.0) as http:
+        resp = await http.post(url, json=payload, params=params,
+                               headers={"Content-Type": "application/json"})
         if resp.status_code != 200:
             raise RuntimeError(
-                f"OpenRouter HTTP {resp.status_code}: {resp.text[:400]}"
+                f"Gemini HTTP {resp.status_code}: {resp.text[:400]}"
             )
         body = resp.json()
 
-    try:
-        message = body["choices"][0]["message"]
-    except (KeyError, IndexError) as ex:
-        raise RuntimeError(f"Unexpected OpenRouter response: {body!r}") from ex
+    candidates = body.get("candidates") or []
+    if not candidates:
+        pf = body.get("promptFeedback") or {}
+        raise RuntimeError(f"Gemini returned no candidates (promptFeedback={pf})")
 
-    images = message.get("images") or []
-    if not images:
-        finish = body["choices"][0].get("finish_reason")
-        snippet = str(message.get("content") or "")[:200]
-        raise RuntimeError(
-            f"OpenRouter returned no images (finish_reason={finish}, text={snippet!r})"
-        )
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    for p in parts:
+        # Google normalises to camelCase (inlineData) but protobuf fallback
+        # is snake_case — handle both so we don't break on SDK changes.
+        data = p.get("inlineData") or p.get("inline_data")
+        if not data:
+            continue
+        b64 = data.get("data")
+        mime = data.get("mimeType") or data.get("mime_type") or "image/png"
+        if b64:
+            return base64.b64decode(b64), mime
 
-    data_url = images[0].get("image_url", {}).get("url") or ""
-    if "," not in data_url:
-        raise RuntimeError(f"bad data URL shape: {data_url[:80]!r}")
-    _, b64 = data_url.split(",", 1)
-    return base64.b64decode(b64)
+    # Log what we got so ops can tell whether the model declined (only text
+    # response, safety block, etc.) or Gemini shape changed upstream.
+    text_snippet = " ".join(str(p.get("text", ""))[:200] for p in parts if "text" in p)
+    raise RuntimeError(
+        f"Gemini returned no inlineData (finishReason="
+        f"{candidates[0].get('finishReason')!r}, text={text_snippet!r})"
+    )
 
 
-async def upload_png(png_bytes: bytes, *, file_name: str) -> str:
+async def upload_image(img_bytes: bytes, *, file_name: str, mime: str) -> str:
     """Presign via findu-oss (chatfile/image, max 10MB) then PUT to S3.
-    Returns the public URL. Bypasses the public gateway and hits the
-    internal ALB with the shared platform bypass key."""
+    Accepts any image/* mime the slot allows (jpeg/png/gif/webp). Bypasses
+    the public gateway and hits the internal ALB with the shared platform
+    bypass key."""
     headers = {
         "Content-Type": "application/json",
         "X-Gateway-Bypass": gateway_bypass_key(),
@@ -247,8 +261,8 @@ async def upload_png(png_bytes: bytes, *, file_name: str) -> str:
         "uploadType": "chatfile",
         "uploadSubtype": "image",
         "fileName": file_name,
-        "fileSize": len(png_bytes),
-        "fileType": "image/png",
+        "fileSize": len(img_bytes),
+        "fileType": mime,
     }
     async with httpx.AsyncClient(timeout=30.0) as http:
         resp = await http.post(
@@ -269,14 +283,23 @@ async def upload_png(png_bytes: bytes, *, file_name: str) -> str:
         public_url = (signed.get("publicUrl") or signed.get("downloadUrl")
                       or upload_url.split("?", 1)[0])
 
-        put_resp = await http.put(upload_url, content=png_bytes,
-                                  headers={"Content-Type": "image/png"})
+        put_resp = await http.put(upload_url, content=img_bytes,
+                                  headers={"Content-Type": mime})
         put_resp.raise_for_status()
     return public_url
 
 
-def _derive_filename(session_id: str) -> str:
+_MIME_EXT = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def _derive_filename(session_id: str, mime: str = "image/png") -> str:
     import re
     import time
     safe = re.sub(r"[^a-zA-Z0-9_-]", "", session_id or "")[:16] or "img"
-    return f"{safe}-{int(time.time())}.png"
+    ext = _MIME_EXT.get(mime, "png")
+    return f"{safe}-{int(time.time())}.{ext}"

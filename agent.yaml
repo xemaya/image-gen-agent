@@ -3,9 +3,9 @@ kind: Agent
 
 metadata:
   name: image_gen
-  version: 1.2.1
+  version: 1.3.0
   displayName: AI 图片生成
-  description: 发一段 prompt，用 OpenRouter openai/gpt-5.4-image-2 生成图片并返回 PNG。免费，不下单。
+  description: 发一段 prompt，用 Google Gemini gemini-3.1-flash-image-preview 生成图片（~15s/张）。免费，不下单。
 
 runtime:
   type: sandbox
@@ -40,18 +40,18 @@ env:
     required: true
   - name: AWS_REGION
     required: false
-  # SSM parameter that holds the OpenRouter API key. Agent reads via boto3 at
+  # SSM parameter that holds the Gemini API key. Agent reads via boto3 at
   # cold start; no plaintext key lives in the image or env.
-  - name: OPENROUTER_API_KEY_PARAM
+  - name: GEMINI_API_KEY_PARAM
     required: false
-    default: "/a2h/agents/image-gen/openrouter-api-key"
+    default: "/a2h/agents/image-gen/gemini-api-key"
   - name: IMAGE_GEN_MODEL
     required: false
-    default: "openai/gpt-5.4-image-2"
+    default: "gemini-3.1-flash-image-preview"
 
 egress:
-  - openrouter.ai                            # image generation via /chat/completions
-  - ssm.us-east-1.amazonaws.com              # OpenRouter key + bypass key
+  - generativelanguage.googleapis.com        # image generation via :generateContent
+  - ssm.us-east-1.amazonaws.com              # Gemini key + bypass key
   - findu-alb-476446960.us-east-1.elb.amazonaws.com   # internal ALB → findu-oss
   - s3.amazonaws.com                         # PUT presigned URL
   - s3.us-east-1.amazonaws.com
